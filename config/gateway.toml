@@ -1,0 +1,18 @@
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["docker"]
+
+[openshell.drivers.docker]
+socket_path = "/var/run/docker.sock"
+allow_driver_config = true
+enable_bind_mounts = true
+sandbox_pids_limit = 4096
+
+# Raw bind mounts cannot satisfy OpenShell's attachment-label admission model.
+# aibox deliberately opts out here because its wrapper only bind-mounts one
+# explicitly selected Git working tree. Do not expose this gateway to untrusted
+# callers that can invoke openshell directly.
+[openshell.drivers.docker.resource_admission]
+enabled = false

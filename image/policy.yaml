@@ -1,0 +1,91 @@
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /etc
+    - /var/log
+    - /proc
+    - /dev/urandom
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+# The image is controlled by this repository and every user-listed path above
+# exists in the workload. Fail startup instead of silently losing these extra
+# filesystem restrictions.
+landlock:
+  compatibility: hard_requirement
+
+# This is a development allowlist, not unrestricted networking. OpenShell
+# denies destinations not listed here (or contributed by an attached provider).
+network_policies:
+  claude:
+    endpoints:
+      - { host: api.anthropic.com, port: 443 }
+      - { host: statsig.anthropic.com, port: 443 }
+      - { host: sentry.io, port: 443 }
+      - { host: platform.claude.com, port: 443 }
+      - { host: claude.ai, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/lib/node_modules/@anthropic-ai/claude-code/** }
+
+  codex:
+    endpoints:
+      - { host: api.openai.com, port: 443 }
+      - { host: auth.openai.com, port: 443 }
+      - { host: chatgpt.com, port: 443 }
+      - { host: ab.chatgpt.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/codex }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/lib/node_modules/@openai/codex/** }
+
+  python_packages:
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+      - { host: download.pytorch.org, port: 443 }
+      - { host: downloads.python.org, port: 443 }
+      - { host: github.com, port: 443 }
+      - { host: api.github.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: release-assets.githubusercontent.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/uv }
+      - { path: /usr/local/bin/uvx }
+      - { path: /usr/bin/python3 }
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+      - { path: /sandbox/.venv/bin/pip }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  npm_registry:
+    endpoints:
+      - { host: registry.npmjs.org, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/npm }
+      - { path: /usr/local/bin/npx }
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/codex }
+
+  github_sources:
+    endpoints:
+      - { host: github.com, port: 443 }
+      - { host: api.github.com, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: release-assets.githubusercontent.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: /usr/local/bin/uv }

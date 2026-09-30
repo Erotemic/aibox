@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AIBOX_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+AIBOX_IMAGE="${AIBOX_IMAGE:-aibox:local}"
+AIBOX_TARGET="${AIBOX_TARGET:-/sandbox/repo}"
+AIBOX_DEFAULT_GPU="${AIBOX_DEFAULT_GPU:-0}"
+
+usage() {
+    cat <<'USAGE'
+aibox - small OpenShell/Docker GPU sandbox helper
+
+Usage:
+  aibox doctor
+  aibox smoke [--gpu GPU]
+  aibox create [OPTIONS] [REPO]
+  aibox shell  [OPTIONS] [REPO]
+  aibox run    [OPTIONS] [REPO] -- COMMAND [ARG...]
+  aibox exec SANDBOX -- COMMAND [ARG...]
+  aibox allow SANDBOX HOST[:PORT] BINARY [BINARY...]
+  aibox logs SANDBOX [extra openshell log args...]
+  aibox list
+  aibox delete SANDBOX [SANDBOX...]
+
+Create/shell/run options:
+  --name NAME          Sandbox name. Auto-generated if omitted.
+  --gpu SPEC           GPU selector: 0, 1, 0,2, GPU-UUID, all, or none.
+                       Default: 0
+  --image IMAGE        OpenShell image/source. Default: aibox:local
+  --cpu CPU            Optional OpenShell CPU limit, e.g. 16 or 500m.
+  --memory MEMORY      Optional memory limit, e.g. 64Gi.
+  --provider NAME      Attach an already-configured OpenShell provider.
+                       Repeatable.
+  --forward PORT       Forward a host-local port to the sandbox. Repeatable.
+  --allow-non-git      Permit mounting a directory that is not a Git worktree.
+
+Examples:
+  aibox shell --gpu 0 ~/code/myrepo
+  aibox shell --gpu 0,1 ~/code/myrepo
+  aibox run --gpu 2 ~/code/myrepo -- claude
+  aibox run --gpu 3 ~/code/myrepo -- codex --sandbox danger-full-access
+  aibox allow mybox pypi.org:443 /usr/local/bin/uv /usr/bin/python3
+
+Notes:
+  * Only the selected repository is bind-mounted from the host.
+  * The Docker socket and host home directory are never mounted into the sandbox.
+  * OpenShell remains the policy/isolation layer. This is still a container
+    boundary, not a VM boundary.
+USAGE
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+run_cmd() {
+    if [[ "${AIBOX_DRY_RUN:-0}" == 1 ]]; then
+        printf '+ '
+        printf '%q ' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+sanitize_name() {
+    local value="$1"
+    value="${value,,}"
+    value="$(printf '%s' "$value" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+    value="${value:0:63}"
+    value="${value%-}"
+    printf '%s' "$value"
+}
+
+resolve_repo() {
+    local input="$1"
+    local allow_non_git="$2"
+    local resolved
+    resolved="$(realpath -e -- "$input")" || die "cannot resolve repository path: $input"
+    [[ -d "$resolved" ]] || die "repository path is not a directory: $resolved"
+
+    if [[ "$allow_non_git" == 0 ]]; then
+        local top
+        top="$(git -C "$resolved" rev-parse --show-toplevel 2>/dev/null)" || \
+            die "$resolved is not a Git worktree (use --allow-non-git to override)"
+        resolved="$(realpath -e -- "$top")"
+    fi
+
+    [[ "$resolved" != / ]] || die "refusing to bind-mount /"
+    if [[ -n "${HOME:-}" ]]; then
+        local home_real
+        home_real="$(realpath -e -- "$HOME" 2>/dev/null || true)"
+        [[ -z "$home_real" || "$resolved" != "$home_real" ]] || \
+            die "refusing to bind-mount the entire home directory"
+    fi
+    printf '%s\n' "$resolved"
+}
+
+numeric_cdi_devices() {
+    nvidia-ctk cdi list 2>/dev/null | \
+        sed -n -E 's#^(nvidia\.com/gpu=[0-9]+)$#\1#p' | sort -V
+}
+
+parse_gpu_spec() {
+    local spec="$1"
+    GPU_CDI=()
+    GPU_COUNT=0
+    [[ "$spec" != none ]] || return 0
+
+    need nvidia-ctk
+    if [[ "$spec" == all ]]; then
+        mapfile -t GPU_CDI < <(numeric_cdi_devices)
+        ((${#GPU_CDI[@]} > 0)) || die "no numeric NVIDIA CDI GPU devices found"
+    else
+        local item
+        IFS=',' read -r -a _gpu_items <<< "$spec"
+        for item in "${_gpu_items[@]}"; do
+            [[ -n "$item" ]] || die "empty GPU selector in: $spec"
+            if [[ "$item" == nvidia.com/gpu=* ]]; then
+                GPU_CDI+=("$item")
+            else
+                GPU_CDI+=("nvidia.com/gpu=$item")
+            fi
+        done
+    fi
+    GPU_COUNT="${#GPU_CDI[@]}"
+
+    local inventory
+    inventory="$(nvidia-ctk cdi list 2>/dev/null || true)"
+    local dev
+    for dev in "${GPU_CDI[@]}"; do
+        grep -Fxq "$dev" <<< "$inventory" || die "CDI GPU device not found: $dev"
+    done
+}
+
+make_driver_json() {
+    local repo="$1"
+    python3 - "$repo" "$AIBOX_TARGET" "${GPU_CDI[@]}" <<'PY'
+import json
+import sys
+repo, target, *gpus = sys.argv[1:]
+docker = {
+    "mounts": [
+        {
+            "type": "bind",
+            "source": repo,
+            "target": target,
+            "read_only": False,
+        }
+    ]
+}
+if gpus:
+    docker["cdi_devices"] = gpus
+print(json.dumps({"docker": docker}, separators=(",", ":")))
+PY
+}
+
+check_docker_version() {
+    local version major
+    version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    [[ -n "$version" ]] || die "Docker daemon is not reachable"
+    major="${version%%.*}"
+    [[ "$major" =~ ^[0-9]+$ ]] || die "cannot parse Docker server version: $version"
+    ((major >= 28)) || die "Docker Engine >= 28 is required; found $version"
+    echo "ok: Docker server $version"
+}
+
+doctor() {
+    need docker
+    need python3
+    check_docker_version
+
+    [[ "$(uname -s)" == Linux ]] || die "aibox currently expects Linux"
+    echo "ok: kernel $(uname -r)"
+
+    if [[ -r /sys/kernel/security/lsm ]] && grep -qw landlock /sys/kernel/security/lsm; then
+        echo "ok: Landlock is active"
+    else
+        die "Landlock is not active in /sys/kernel/security/lsm"
+    fi
+
+    if [[ -r "/boot/config-$(uname -r)" ]]; then
+        grep -q '^CONFIG_SECURITY_LANDLOCK=y$' "/boot/config-$(uname -r)" || \
+            die "CONFIG_SECURITY_LANDLOCK=y not found"
+        grep -q '^CONFIG_USER_NS=y$' "/boot/config-$(uname -r)" || \
+            die "CONFIG_USER_NS=y not found"
+        echo "ok: kernel config has Landlock and user namespaces"
+    fi
+
+    need nvidia-smi
+    need nvidia-ctk
+    nvidia-smi -L >/dev/null
+    echo "ok: nvidia-smi sees GPUs"
+
+    local cdi
+    cdi="$(nvidia-ctk cdi list 2>/dev/null || true)"
+    grep -q '^nvidia.com/gpu=0$' <<< "$cdi" || die "NVIDIA CDI device 0 not found"
+    echo "ok: NVIDIA CDI inventory is present"
+
+    if docker info 2>/dev/null | grep -q 'cdi: nvidia.com/gpu=0'; then
+        echo "ok: Docker discovered NVIDIA CDI devices"
+    else
+        die "Docker does not report NVIDIA CDI devices"
+    fi
+
+    if docker image inspect "$AIBOX_IMAGE" >/dev/null 2>&1; then
+        local image_user expected_user
+        image_user="$(docker image inspect "$AIBOX_IMAGE" --format '{{.Config.User}}')"
+        expected_user="$(id -u):$(id -g)"
+        if [[ "$image_user" == "$expected_user" ]]; then
+            echo "ok: $AIBOX_IMAGE matches host UID/GID $expected_user"
+        else
+            echo "warn: $AIBOX_IMAGE user is $image_user, host is $expected_user; rebuild with scripts/build-image.sh" >&2
+        fi
+    else
+        echo "warn: workload image $AIBOX_IMAGE is not built yet" >&2
+    fi
+
+    if command -v openshell >/dev/null 2>&1; then
+        openshell status
+        echo "ok: OpenShell CLI/gateway reachable"
+    else
+        echo "warn: openshell is not installed; run ./bootstrap.sh" >&2
+    fi
+}
+
+parse_create_args() {
+    NAME=""
+    GPU_SPEC="$AIBOX_DEFAULT_GPU"
+    IMAGE="$AIBOX_IMAGE"
+    CPU=""
+    MEMORY=""
+    ALLOW_NON_GIT=0
+    PROVIDERS=()
+    FORWARDS=()
+    REPO_INPUT="."
+
+    while (($#)); do
+        case "$1" in
+            --name) [[ $# -ge 2 ]] || die "--name requires a value"; NAME="$2"; shift 2 ;;
+            --gpu) [[ $# -ge 2 ]] || die "--gpu requires a value"; GPU_SPEC="$2"; shift 2 ;;
+            --image) [[ $# -ge 2 ]] || die "--image requires a value"; IMAGE="$2"; shift 2 ;;
+            --cpu) [[ $# -ge 2 ]] || die "--cpu requires a value"; CPU="$2"; shift 2 ;;
+            --memory) [[ $# -ge 2 ]] || die "--memory requires a value"; MEMORY="$2"; shift 2 ;;
+            --provider) [[ $# -ge 2 ]] || die "--provider requires a value"; PROVIDERS+=("$2"); shift 2 ;;
+            --forward) [[ $# -ge 2 ]] || die "--forward requires a value"; FORWARDS+=("$2"); shift 2 ;;
+            --allow-non-git) ALLOW_NON_GIT=1; shift ;;
+            --) shift; CREATE_REST=("$@"); return 0 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                REPO_INPUT="$1"
+                shift
+                if (($#)); then
+                    [[ "$1" == -- ]] || die "unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+    CREATE_REST=()
+}
+
+create_sandbox() {
+    local repo="$1"
+    parse_gpu_spec "$GPU_SPEC"
+    local driver_json
+    driver_json="$(make_driver_json "$repo")"
+
+    local slug
+    slug="$(sanitize_name "$(basename "$repo")")"
+    slug="${slug:0:36}"
+    if [[ -z "$NAME" ]]; then
+        NAME="$(sanitize_name "aibox-${slug}-$(date +%m%d%H%M%S)")"
+    else
+        NAME="$(sanitize_name "$NAME")"
+    fi
+    [[ -n "$NAME" ]] || die "sandbox name contains no usable characters"
+
+    local args=(openshell sandbox create --name "$NAME" --detach --from "$IMAGE")
+    if ((GPU_COUNT > 0)); then
+        args+=(--gpu "$GPU_COUNT")
+    fi
+    args+=(--driver-config-json "$driver_json")
+    [[ -z "$CPU" ]] || args+=(--cpu "$CPU")
+    [[ -z "$MEMORY" ]] || args+=(--memory "$MEMORY")
+    local f
+    for f in "${FORWARDS[@]}"; do
+        args+=(--forward "$f")
+    done
+    if ((${#PROVIDERS[@]})); then
+        local p
+        for p in "${PROVIDERS[@]}"; do
+            args+=(--provider "$p")
+        done
+    else
+        args+=(--no-auto-providers)
+    fi
+    args+=(--label aibox=true --label "aibox.repo=$slug")
+
+    run_cmd "${args[@]}"
+    printf '%s\n' "$NAME"
+}
+
+cmd_create() {
+    need openshell; need git; need realpath; need python3
+    parse_create_args "$@"
+    ((${#CREATE_REST[@]} == 0)) || die "create does not take a command; use aibox run"
+    local repo
+    repo="$(resolve_repo "$REPO_INPUT" "$ALLOW_NON_GIT")"
+    create_sandbox "$repo" >/dev/null
+    echo "created: $NAME"
+    echo "repo:    $repo -> $AIBOX_TARGET"
+    echo "gpu:     $GPU_SPEC"
+}
+
+cmd_shell() {
+    need openshell; need git; need realpath; need python3
+    parse_create_args "$@"
+    ((${#CREATE_REST[@]} == 0)) || die "shell does not take a command; use aibox run"
+    local repo
+    repo="$(resolve_repo "$REPO_INPUT" "$ALLOW_NON_GIT")"
+    create_sandbox "$repo" >/dev/null
+    echo "sandbox: $NAME" >&2
+    run_cmd openshell sandbox exec --name "$NAME" --workdir "$AIBOX_TARGET" --tty -- /bin/bash -l
+}
+
+cmd_run() {
+    need openshell; need git; need realpath; need python3
+    parse_create_args "$@"
+    ((${#CREATE_REST[@]} > 0)) || die "run requires -- COMMAND [ARG...]"
+    local repo
+    repo="$(resolve_repo "$REPO_INPUT" "$ALLOW_NON_GIT")"
+    create_sandbox "$repo" >/dev/null
+    echo "sandbox: $NAME" >&2
+    run_cmd openshell sandbox exec --name "$NAME" --workdir "$AIBOX_TARGET" --tty -- "${CREATE_REST[@]}"
+}
+
+cmd_exec() {
+    need openshell
+    [[ $# -ge 3 && "$2" == -- ]] || die "usage: aibox exec SANDBOX -- COMMAND [ARG...]"
+    local name="$1"; shift 2
+    run_cmd openshell sandbox exec --name "$name" --workdir "$AIBOX_TARGET" --tty -- "$@"
+}
+
+cmd_allow() {
+    need openshell
+    [[ $# -ge 3 ]] || die "usage: aibox allow SANDBOX HOST[:PORT] BINARY [BINARY...]"
+    local name="$1" endpoint="$2"; shift 2
+    [[ "$endpoint" == *:* ]] || endpoint="$endpoint:443"
+    local host="${endpoint%%:*}"
+    local rule
+    rule="aibox_$(sanitize_name "${host//./_}")"
+    local args=(openshell policy update "$name" --rule-name "$rule" --add-endpoint "$endpoint")
+    local binary
+    for binary in "$@"; do
+        args+=(--binary "$binary")
+    done
+    args+=(--wait)
+    run_cmd "${args[@]}"
+}
+
+cmd_smoke() {
+    need openshell; need git; need realpath; need python3
+    local gpu="$AIBOX_DEFAULT_GPU"
+    while (($#)); do
+        case "$1" in
+            --gpu) [[ $# -ge 2 ]] || die "--gpu requires a value"; gpu="$2"; shift 2 ;;
+            -h|--help) echo "usage: aibox smoke [--gpu GPU]"; return 0 ;;
+            *) die "unknown smoke option: $1" ;;
+        esac
+    done
+
+    local temp name
+    temp="$(mktemp -d)"
+    git -C "$temp" init -q
+    printf 'host\n' > "$temp/host.txt"
+    name="aibox-smoke-$$"
+    cleanup() {
+        openshell sandbox delete "$name" >/dev/null 2>&1 || true
+        rm -rf "$temp"
+    }
+    trap cleanup EXIT
+
+    NAME="$name"
+    GPU_SPEC="$gpu"
+    IMAGE="$AIBOX_IMAGE"
+    CPU=""
+    MEMORY=""
+    PROVIDERS=()
+    FORWARDS=()
+    local repo="$temp"
+    create_sandbox "$repo" >/dev/null
+
+    echo "==> GPU visibility"
+    openshell sandbox exec --name "$name" --workdir "$AIBOX_TARGET" --no-login-shell -- nvidia-smi -L
+
+    echo "==> Worktree write-through"
+    openshell sandbox exec --name "$name" --workdir "$AIBOX_TARGET" --no-login-shell -- \
+        /bin/bash -c 'printf "sandbox\\n" > sandbox.txt && test -f host.txt'
+    grep -qx sandbox "$temp/sandbox.txt" || die "sandbox write did not reach host worktree"
+
+    echo "==> Effective policy summary"
+    openshell policy get "$name" --full | sed -n '1,120p'
+
+    echo "ok: OpenShell GPU sandbox and repository bind mount work"
+    cleanup
+    trap - EXIT
+}
+
+main() {
+    local cmd="${1:-help}"
+    [[ $# -eq 0 ]] || shift
+    case "$cmd" in
+        help|-h|--help) usage ;;
+        doctor) doctor "$@" ;;
+        smoke) cmd_smoke "$@" ;;
+        create) cmd_create "$@" ;;
+        shell) cmd_shell "$@" ;;
+        run) cmd_run "$@" ;;
+        exec) cmd_exec "$@" ;;
+        allow) cmd_allow "$@" ;;
+        logs) need openshell; [[ $# -ge 1 ]] || die "usage: aibox logs SANDBOX [ARGS...]"; name="$1"; shift; run_cmd openshell logs "$name" "$@" ;;
+        list) need openshell; run_cmd openshell sandbox list --selector aibox=true ;;
+        delete|rm) need openshell; (($# > 0)) || die "usage: aibox delete SANDBOX [SANDBOX...]"; run_cmd openshell sandbox delete "$@" ;;
+        *) die "unknown command: $cmd (try: aibox --help)" ;;
+    esac
+}
+
+main "$@"
